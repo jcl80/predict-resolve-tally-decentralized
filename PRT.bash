@@ -1,8 +1,13 @@
 #!/bin/bash
 
-pendingPredictions="~/Documents/core/forecasting/past/PredictResolveTally/pendingPredictions.txt"
+# Load config from .env (same directory as script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.env"
+
+# Set paths from env
+pendingPredictions="${PREDICTIONS_DIR}/pendingPredictions.txt"
 pendingPredictionsTemp="${pendingPredictions}.t"
-resolvedPredictions="~/Documents/core/forecasting/past/PredictResolveTally/resolvedPredictions.txt"
+resolvedPredictions="${PREDICTIONS_DIR}/resolvedPredictions.txt"
 
 function predict(){
         read -p "> Statement: " statement
