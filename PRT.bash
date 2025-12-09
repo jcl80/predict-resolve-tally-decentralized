@@ -13,6 +13,15 @@ hashesFile="${PREDICTIONS_DIR}/hashes.txt"
 # Solana CLI path
 SOLANA_CLI="$HOME/.local/share/solana/install/active_release/bin/solana"
 
+# Determine cluster for explorer URLs
+if [[ "$SOLANA_RPC" == *"devnet"* ]]; then
+        SOLANA_CLUSTER="devnet"
+elif [[ "$SOLANA_RPC" == *"testnet"* ]]; then
+        SOLANA_CLUSTER="testnet"
+else
+        SOLANA_CLUSTER="mainnet"
+fi
+
 # Convert base58 private key to temp keypair file for Solana CLI
 function get_keypair_file(){
         local tmpfile=$(mktemp)
@@ -63,7 +72,11 @@ function predict(){
                 echo -e "${hash}\t${salt}\t${tx_sig}\t${date}\t${probability}\t${statement}" >> "$hashesFile"
                 echo "Hash: $hash"
                 echo "Tx: $tx_sig"
-                echo "View: https://explorer.solana.com/tx/${tx_sig}?cluster=devnet"
+                if [ "$SOLANA_CLUSTER" = "mainnet" ]; then
+                        echo "View: https://explorer.solana.com/tx/${tx_sig}"
+                else
+                        echo "View: https://explorer.solana.com/tx/${tx_sig}?cluster=${SOLANA_CLUSTER}"
+                fi
         else
                 echo -e "${hash}\t${salt}\tFAILED\t${date}\t${probability}\t${statement}" >> "$hashesFile"
                 echo "Hash: $hash"
@@ -91,7 +104,13 @@ function resolve(){
                         echo -e "$resolutionState\t$date\t$probability\t$statement" >> "$pendingPredictionsTemp"
                 fi
         done 9< "$pendingPredictions"
-        mv $pendingPredictionsTemp $pendingPredictions
+
+        # Replace pending file (create empty if no pending predictions left)
+        if [ -f "$pendingPredictionsTemp" ]; then
+                mv "$pendingPredictionsTemp" "$pendingPredictions"
+        else
+                > "$pendingPredictions"
+        fi
 }
 
 # Verify a single prediction by recalculating hash and checking Solana
@@ -112,10 +131,26 @@ function verify_single(){
         # Recalculate hash
         local recalc_hash=$(echo -n "${statement}|${probability}|${date}|${salt}" | sha256sum | cut -d' ' -f1)
 
-        # Fetch tx from Solana and extract memo
-        local tx_data=$(curl -s -X POST "$SOLANA_RPC" \
-                -H "Content-Type: application/json" \
-                -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"$tx_sig\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":0}]}")
+        # Fetch tx from Solana and extract memo (with retry on rate limit)
+        local tx_data=""
+        local max_retries=3
+        for ((attempt=1; attempt<=max_retries; attempt++)); do
+                local response=$(curl -s -i -X POST "$SOLANA_RPC" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"$tx_sig\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":0}]}")
+
+                # Split headers and body
+                local headers=$(echo "$response" | sed '/^\r$/q')
+                tx_data=$(echo "$response" | sed '1,/^\r$/d')
+
+                if echo "$tx_data" | grep -q '"code": 429'; then
+                        local retry_after=$(echo "$headers" | grep -i 'Retry-After' | cut -d':' -f2 | tr -d ' \r')
+                        retry_after=${retry_after:-2}
+                        sleep "$retry_after"
+                else
+                        break
+                fi
+        done
 
         local memo=$(echo "$tx_data" | python3 -c "
 import sys, json
@@ -208,6 +243,7 @@ function verifyall(){
 
         while IFS=$'\t' read -r hash salt tx_sig date probability statement; do
                 verify_single "$hash" "$salt" "$tx_sig" "$date" "$probability" "$statement"
+                sleep 2  # Avoid rate limiting on public RPC
         done < "$hashesFile"
 }
 
