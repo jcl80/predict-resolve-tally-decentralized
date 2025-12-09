@@ -8,12 +8,67 @@ source "$SCRIPT_DIR/.env"
 pendingPredictions="${PREDICTIONS_DIR}/pendingPredictions.txt"
 pendingPredictionsTemp="${pendingPredictions}.t"
 resolvedPredictions="${PREDICTIONS_DIR}/resolvedPredictions.txt"
+hashesFile="${PREDICTIONS_DIR}/hashes.txt"
+
+# Solana CLI path
+SOLANA_CLI="$HOME/.local/share/solana/install/active_release/bin/solana"
+
+# Convert base58 private key to temp keypair file for Solana CLI
+function get_keypair_file(){
+        local tmpfile=$(mktemp)
+        echo "$SOLANA_PRIVATE_KEY" | python3 -c "
+import sys, json, base58
+key = base58.b58decode(sys.stdin.read().strip())
+print(json.dumps(list(key)))
+" > "$tmpfile"
+        echo "$tmpfile"
+}
+
+# Send hash to Solana as memo, return tx signature
+function send_to_solana(){
+        local hash=$1
+        local keypair_file=$(get_keypair_file)
+        local pubkey=$($SOLANA_CLI address -k "$keypair_file")
+
+        # Send 0 SOL to self with memo
+        local tx_sig=$($SOLANA_CLI transfer "$pubkey" 0 \
+                --from "$keypair_file" \
+                --url "$SOLANA_RPC" \
+                --with-memo "$hash" \
+                --allow-unfunded-recipient \
+                --fee-payer "$keypair_file" \
+                2>/dev/null | grep -oE '[A-Za-z0-9]{87,88}' | head -1)
+
+        rm "$keypair_file"
+        echo "$tx_sig"
+}
 
 function predict(){
         read -p "> Statement: " statement
         read -p "> Probability (%): " probability
         read -p "> Date of resolution (year/month/day): " date
-        echo -e "UNRESOLVED\t$date\t$probability\t$statement" >> $pendingPredictions
+
+        # Generate salt and hash for blockchain commitment
+        salt=$(openssl rand -hex 16)
+        hash=$(echo -n "${statement}|${probability}|${date}|${salt}" | sha256sum | cut -d' ' -f1)
+
+        # Save prediction locally
+        echo -e "UNRESOLVED\t$date\t$probability\t$statement" >> "$pendingPredictions"
+
+        # Send hash to Solana
+        echo "Sending to Solana..."
+        tx_sig=$(send_to_solana "$hash")
+
+        if [ -n "$tx_sig" ]; then
+                echo -e "${hash}\t${salt}\t${tx_sig}\t${date}\t${probability}\t${statement}" >> "$hashesFile"
+                echo "Hash: $hash"
+                echo "Tx: $tx_sig"
+                echo "View: https://explorer.solana.com/tx/${tx_sig}?cluster=devnet"
+        else
+                echo -e "${hash}\t${salt}\tFAILED\t${date}\t${probability}\t${statement}" >> "$hashesFile"
+                echo "Hash: $hash"
+                echo "Warning: Solana transaction failed"
+        fi
 }
 
 function resolve(){
@@ -33,10 +88,127 @@ function resolve(){
                         echo -e "$resolutionState\t$date\t$probability\t$statement" >> $resolvedPredictions
                 else
                         # Not yet resolved
-                        echo -e "$resolutionState\t$date\t$probability\t$statement" >> $resolvedPredictions >> $pendingPredictionsTemp
+                        echo -e "$resolutionState\t$date\t$probability\t$statement" >> "$pendingPredictionsTemp"
                 fi
         done 9< "$pendingPredictions"
         mv $pendingPredictionsTemp $pendingPredictions
+}
+
+# Verify a single prediction by recalculating hash and checking Solana
+function verify_single(){
+        local stored_hash=$1
+        local salt=$2
+        local tx_sig=$3
+        local date=$4
+        local probability=$5
+        local statement=$6
+
+        # Skip if no tx signature
+        if [ "$tx_sig" = "PENDING" ] || [ "$tx_sig" = "FAILED" ]; then
+                echo "[SKIP] $statement - no tx on chain"
+                return
+        fi
+
+        # Recalculate hash
+        local recalc_hash=$(echo -n "${statement}|${probability}|${date}|${salt}" | sha256sum | cut -d' ' -f1)
+
+        # Fetch tx from Solana and extract memo
+        local tx_data=$(curl -s -X POST "$SOLANA_RPC" \
+                -H "Content-Type: application/json" \
+                -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"$tx_sig\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":0}]}")
+
+        local memo=$(echo "$tx_data" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+try:
+    logs = data['result']['meta']['logMessages']
+    for log in logs:
+        if 'Memo' in log:
+            # Extract hash from memo log
+            parts = log.split('\"')
+            if len(parts) >= 2:
+                print(parts[1])
+                break
+except:
+    pass
+" 2>/dev/null)
+
+        # Get block time
+        local block_time=$(echo "$tx_data" | python3 -c "
+import sys, json
+from datetime import datetime
+data = json.load(sys.stdin)
+try:
+    ts = data['result']['blockTime']
+    print(datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S UTC'))
+except:
+    print('unknown')
+" 2>/dev/null)
+
+        # Compare
+        if [ "$recalc_hash" = "$stored_hash" ] && [ "$memo" = "$stored_hash" ]; then
+                echo "[OK] $statement"
+                echo "     Committed: $block_time"
+        elif [ "$recalc_hash" != "$stored_hash" ]; then
+                echo "[FAIL] $statement - local hash mismatch"
+        elif [ -z "$memo" ]; then
+                echo "[FAIL] $statement - could not fetch memo from Solana"
+        else
+                echo "[FAIL] $statement - chain hash mismatch"
+        fi
+}
+
+# List predictions and verify selected one
+function verify(){
+        if [ ! -f "$hashesFile" ]; then
+                echo "No predictions to verify"
+                return
+        fi
+
+        # Show numbered list
+        echo "Predictions:"
+        local i=1
+        while IFS=$'\t' read -r hash salt tx_sig date probability statement; do
+                local status="ON CHAIN"
+                [ "$tx_sig" = "PENDING" ] || [ "$tx_sig" = "FAILED" ] && status="$tx_sig"
+                echo "$i. $statement ($date) - $status"
+                ((i++))
+        done < "$hashesFile"
+
+        echo ""
+        read -p "> Select number to verify: " selection
+
+        # Get selected line
+        local line=$(sed -n "${selection}p" "$hashesFile")
+        if [ -z "$line" ]; then
+                echo "Invalid selection"
+                return
+        fi
+
+        local hash=$(echo "$line" | cut -d$'\t' -f1)
+        local salt=$(echo "$line" | cut -d$'\t' -f2)
+        local tx_sig=$(echo "$line" | cut -d$'\t' -f3)
+        local date=$(echo "$line" | cut -d$'\t' -f4)
+        local probability=$(echo "$line" | cut -d$'\t' -f5)
+        local statement=$(echo "$line" | cut -d$'\t' -f6)
+
+        echo ""
+        verify_single "$hash" "$salt" "$tx_sig" "$date" "$probability" "$statement"
+}
+
+# Verify all predictions
+function verifyall(){
+        if [ ! -f "$hashesFile" ]; then
+                echo "No predictions to verify"
+                return
+        fi
+
+        echo "Verifying all predictions..."
+        echo ""
+
+        while IFS=$'\t' read -r hash salt tx_sig date probability statement; do
+                verify_single "$hash" "$salt" "$tx_sig" "$date" "$probability" "$statement"
+        done < "$hashesFile"
 }
 
 function tally(){

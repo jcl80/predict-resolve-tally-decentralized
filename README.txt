@@ -1,81 +1,106 @@
-# PRT: Predict, Resolve & Tally
+# PRT: Predict, Resolve & Tally (Decentralized)
 
-57 lines of code which allow you to make predictions, resolve, and tally them,
-without many user niceties. Name inspired by PRT, from the Worm serial
+A bash tool to make predictions, resolve them, and tally your calibration.
+Each prediction is hashed and committed to Solana blockchain for verifiable timestamps.
+
+Fork of [NunoSempere/predict-resolve-tally](https://github.com/NunoSempere/predict-resolve-tally)
+
+## Features
+
+- **predict** - Make a new prediction (saved locally + hash sent to Solana)
+- **resolve** - Resolve predictions whose dates have passed
+- **tally** - See your calibration stats
+- **verify** - Verify a single prediction against Solana
+- **verifyall** - Verify all predictions against Solana
 
 ## Example of use
 
-Open a terminal, with Ctrl+Alt+T
-
-The command predict creates a new prediction:
-
+```
 $ predict
-> Statement: Before 1 July 2020 will SpaceX launch its first crewed mission into orbit?
-> Probability (%): 50
-> Date of resolution (year/month/day): 2020/07/01
+> Statement: Before 1 July 2025 will SpaceX launch Starship to orbit?
+> Probability (%): 70
+> Date of resolution (year/month/day): 2025/07/01
+Sending to Solana...
+Hash: 360d8eb5257bbd40e997f58e6f929bd8a997eef5bbccdbee603b157e3b97f1d0
+Tx: 4RFobBkCwbSHxs99taXf7CRFEFAZa8fFqhEUURzBS7rf...
+View: https://explorer.solana.com/tx/4RFobBkCwbSHxs99...?cluster=devnet
 
-The command resolve resolves all predictions whose dates have passed.
+$ verifyall
+Verifying all predictions...
+
+[OK] Before 1 July 2025 will SpaceX launch Starship to orbit?
+     Committed: 2025-12-09 17:18:52 UTC
 
 $ resolve
-Before 10 April 2020 will former Catalan President Carles Puigdemont return to Spain? (2020/04/10)
+Before 1 July 2025 will SpaceX launch Starship to orbit? (2025/07/01)
 > (TRUE/FALSE) TRUE
 
-The command tally tallies how you did for all resolved predictions.
-
 $ tally
-0 to 10 : 0 TRUE and 10 FALSE
-10 to 20 : 0 TRUE and 5 FALSE
-20 to 30 : 1 TRUE and 3 FALSE
-30 to 40 : 2 TRUE and 7 FALSE
-40 to 50 : 10 TRUE and 11 FALSE
-50 to 60 : 10 TRUE and 10 FALSE
-60 to 70 : 7 TRUE and 0 FALSE
-70 to 80 : 10 TRUE and 2 FALSE
-80 to 90 : 10 TRUE and 1 FALSE
-90 to 100 : 1 TRUE and 0 FALSE
+0 to 10 : 0 TRUE and 0 FALSE
+...
+60 to 70 : 1 TRUE and 0 FALSE
+...
+```
 
 ## Installation
 
-### 1. Add the following to your .bashrc
+### 1. Dependencies
 
-Copy the contents or source the PRT file to your .bashrc file. For example:
+- bash
+- openssl
+- python3 with base58 (`pip install base58`)
+- Solana CLI (https://docs.solana.com/cli/install-solana-cli-tools)
 
-```
-[ -f /home/nuno/Documents/PRT ] && source /home/nuno/Documents/PRT
-```
+### 2. Configure .env
 
-### 2. Change the directory.
-
-Change the first 3 lines so that the program uses the directory of your choice. 
-For example, in my system they might be:
+Copy `.env.example` to `.env` and fill in:
 
 ```
-pendingPredictions=~/Documents/Forecasting/pendingPredictions.txt
-pendingPredictionsTemp="${pendingPredictions}.t"
-resolvedPredictions=~/Documents/Forecasting/resolvedPredictions.txt
+PREDICTIONS_DIR=~/path/to/your/predictions/folder
+SOLANA_PRIVATE_KEY=your_base58_private_key_here
+SOLANA_RPC=https://api.devnet.solana.com
 ```
+
+For mainnet, use: `SOLANA_RPC=https://api.mainnet-beta.solana.com`
+
+### 3. Create predictions directory
+
+```
+mkdir -p ~/path/to/your/predictions/folder
+```
+
+### 4. Add to .bashrc
+
+```
+[ -f /path/to/PRT.bash ] && source /path/to/PRT.bash
+```
+
+## How it works
+
+1. When you `predict`, a random salt is generated
+2. Hash = SHA256(statement|probability|date|salt)
+3. Hash is sent to Solana as a memo transaction
+4. Local file stores: hash, salt, tx_signature, prediction data
+5. `verify` recalculates hash and compares with on-chain memo
+
+This proves you made the prediction before the resolution date, without revealing it until you choose to.
 
 ## Gotchas
 
-CSV
-- Statements, predictions and probabilities are saved, internally, as a tsv
-  file.
-- This requires not using tabs in your statements
-- A previous version required not using commas instead, but this has now
-  changed
+**TSV format**
+- Data is stored as tab-separated values
+- Don't use tabs in your statements
 
-Dates: 
-- Dates are in the year/month/day format, so that they can be compared 
-  alphanumerically as strings. That is, an earlier date, in this format, would 
-  come earlier in a dictionary than a later date. 
-- 2020/7/1 is not a valid date, because it would come after 2020/10/01. Write 
-  dates using two digits for both month and dates, like: 2020/07/01.
+**Dates**
+- Use year/month/day format (e.g., 2025/07/01)
+- Always use two digits for month and day (07 not 7)
 
-Runs using bash. <https://en.wikipedia.org/wiki/Bash_(Unix_shell)>
+**Solana costs**
+- Each prediction costs ~0.000005 SOL (~$0.001)
+- Verification is free (read-only)
 
-Windows and Mac are not supported, though you could get this to run there if
-you wanted to, through various bash for Windows interpreters, like the one that 
-comes with git for Windows <https://git-scm.com/download/win>
+## Files
 
-The tally function only accepts predictions with 1% granularity, and it
-aggregates them with 10% granularity.
+- `pendingPredictions.txt` - Predictions not yet resolved
+- `resolvedPredictions.txt` - Resolved predictions with TRUE/FALSE
+- `hashes.txt` - Hash, salt, tx_signature, and prediction data
